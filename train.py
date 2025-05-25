@@ -2,6 +2,12 @@
 CUDA_DEVICE_MAX_CONNECTIONS=1 torchrun --nproc_per_node 4 --master_addr localhost --master_port 25500 train.py --config tmp/fast_benchmark/120M_model_tiny_stories_dp=4.json
 CUDA_DEVICE_MAX_CONNECTIONS=1 debugpy-run -p 5678 -m torch.distributed.run -- --nproc_per_node=4 --nnodes=1 --rdzv_backend=c10d --rdzv_endpoint=localhost:29400 train.py --config tmp/dummy/llama2_7b_benchmark.json
 """
+
+try:
+  import habana_frameworks.torch.gpu_migration
+except:
+  pass
+
 import os
 import inspect
 import json
@@ -23,7 +29,7 @@ from picotron.process_group_manager import setup_process_group_manager
 from picotron.pipeline_parallel.pipeline_parallel import train_step_pipeline_1f1b, train_step_pipeline_afab, PipelineParallel
 from picotron.data_parallel.data_parallel import DataParallelBucket
 from picotron.model import Llama
-from picotron.utils import download_model
+from picotron.utils import download_model, HabanaProfile
 import wandb
 
 def train_step(model, data_loader, device):
@@ -57,10 +63,15 @@ def train_step(model, data_loader, device):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="", help="Path to config file")
+    parser.add_argument("--total-train-steps", type=int, default=None)
+    parser.add_argument("--profile", type=str, default=None, help="example: --profile 5,1 which have 5 warmup steps then and profile 1 step")
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
         config = json.load(f)
+
+    if args.total_train_steps:
+        config["training"]["total_train_steps"] = args.total_train_steps
     
     os.environ["OMP_NUM_THREADS"] = config["environment"]["OMP_NUM_THREADS"]
     os.environ["TOKENIZERS_PARALLELISM"] = config["environment"]["TOKENIZERS_PARALLELISM"]
@@ -215,6 +226,14 @@ if __name__ == "__main__":
         step, trained_tokens = checkpoint_manager.load_checkpoint(model, optimizer, config["checkpoint"]["load_path"])
     
     dist.barrier()
+
+    if args.profile:
+        warmup, active = (int(x) for x in args.profile.split(','))
+        profiler = HabanaProfile(warmup=warmup, active=active)
+    else:
+        profiler = None
+    if profiler:
+        profiler.start()
     
     while config["training"]["max_tokens"] is None or trained_tokens < config["training"]["max_tokens"]:
         step_start_time = time.time()
@@ -243,6 +262,8 @@ if __name__ == "__main__":
         tokens_per_second = tokens_per_step / step_duration
         tokens_per_second_per_gpu = tokens_per_second / world_size
         mfu = get_mfu(tokens_per_second_per_gpu, num_params, model_config)
+        if profiler:
+            profiler.step()
         
         if is_wandb_rank:
             print(
@@ -275,6 +296,8 @@ if __name__ == "__main__":
         if step >= config["training"]["total_train_steps"]:
             break
     
+    if profiler:
+        profiler.stop()
     if is_wandb_rank and config["logging"]["use_wandb"]:
         wandb.finish()
 
